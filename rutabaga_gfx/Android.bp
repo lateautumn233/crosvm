@@ -36,8 +36,6 @@ rust_library {
         "libzerocopy",
     ],
     proc_macros: ["libremain"],
-    static_libs: [
-    ],
     shared_libs: [
         "libc++",
         "libbase",

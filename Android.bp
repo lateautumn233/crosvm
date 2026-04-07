@@ -34,6 +34,17 @@ license {
     ],
 }
 
+filegroup {
+    name: "crosvm_main_rs",
+    srcs: ["src/main.rs"],
+    visibility: ["//external/crosvm:__subpackages__"],
+}
+
+phony {
+    name: "crosvm_device_only",
+    required: ["crosvm_device_only_bin"],
+}
+
 rust_binary {
     name: "crosvm",
     defaults: ["crosvm_defaults"],
