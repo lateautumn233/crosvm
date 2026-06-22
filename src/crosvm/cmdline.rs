@@ -60,6 +60,7 @@ use devices::SerialParameters;
 use devices::StubPciParameters;
 #[cfg(target_arch = "x86_64")]
 use hypervisor::CpuHybridType;
+use hypervisor::LendMthpMode;
 use hypervisor::ProtectionType;
 use merge::vec::append;
 use resources::AddressRange;
@@ -2017,12 +2018,15 @@ pub struct RunCommand {
     ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
 
-    #[argh(switch)]
+    #[argh(option, arg_name = "single|chunked")]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
     /// run mTHP preparation on lend regions (drop caches, enable mTHP,
-    /// populate, MADV_COLLAPSE, mlock, chunked LEND)
-    pub prepare_lend_mthp: Option<bool>,
+    /// populate, MADV_COLLAPSE, mlock), then LEND the prepared region as a
+    /// single parcel ("single", for eager-parcel kernels such as sm8650) or
+    /// split into <=256MB parcels ("chunked", for demand-paging kernels such
+    /// as sm8750)
+    pub prepare_lend_mthp: Option<LendMthpMode>,
 
     #[cfg(feature = "process-invariants")]
     #[argh(option, arg_name = "PATH")]
@@ -2989,7 +2993,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         cfg.hugepages = cmd.hugepages.unwrap_or_default();
-        cfg.prepare_lend_mthp = cmd.prepare_lend_mthp.unwrap_or_default();
+        cfg.prepare_lend_mthp = cmd.prepare_lend_mthp;
 
         // `cfg.hypervisor` may have been set by the deprecated `--kvm-device` option above.
         // TODO(b/274817652): remove this workaround when `--kvm-device` is removed.
