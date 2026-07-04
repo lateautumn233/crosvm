@@ -286,9 +286,17 @@ impl GunyahVm {
 
                 if let Some(mthp_mode) = cfg.prepare_lend_mthp {
                     // Full mTHP preparation: drop caches, enable mTHP,
-                    // populate in batches, cascading MADV_COLLAPSE, mlock.
+                    // populate in batches, MADV_COLLAPSE, mlock.
+                    //
+                    // Single (eager-parcel, sm8650) demands strict full-2MB
+                    // backing: a misaligned segment in the one-shot parcel
+                    // deadlocks RM and watchdog-reboots the device, so we abort
+                    // VM start rather than lend a sub-2MB segment. Chunked
+                    // (demand-paging, sm8750) tolerates mixed-size segments.
+                    let strict = matches!(mthp_mode, LendMthpMode::Single);
                     // SAFETY: host_ptr is a valid mapping of region_size bytes.
-                    let prep = unsafe { mthp::prepare_lend_region(host_ptr, region_size) };
+                    let prep = unsafe { mthp::prepare_lend_region(host_ptr, region_size, strict) }
+                        .map_err(|errno| Error::new(errno))?;
 
                     let chunks = match mthp_mode {
                         // Single-parcel: keep the whole prepared region in one

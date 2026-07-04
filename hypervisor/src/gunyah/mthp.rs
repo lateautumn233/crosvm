@@ -15,6 +15,7 @@
 use std::fs;
 use std::io::Write;
 
+use base::error;
 use base::info;
 use base::warn;
 
@@ -72,6 +73,45 @@ fn trigger_compact() {
     write_file("/proc/sys/vm/compact_memory", "1\n");
 }
 
+/// One pass of MADV_COLLAPSE at the 2MB level over every window that is not yet
+/// a full 2MB folio.  Updates `order_map` (order 9) for every window that
+/// collapses successfully.  Returns `(collapsed, failed)`.
+///
+/// Unlike the diagnostic cascade in [`prepare_lend_region`], this NEVER accepts
+/// a sub-2MB fallback: a window is either promoted to a true 2MB THP or counted
+/// as failed.  This is required for eager-parcel kernels (sm8650) where a single
+/// non-2MB segment in the LEND parcel deadlocks RM.
+///
+/// # Safety
+/// `host_addr` must point to a valid mapping of at least `size` bytes.
+unsafe fn collapse_2mb_pass(host_addr: *mut u8, size: u64, order_map: &mut [u8]) -> (u64, u64) {
+    let units_per_thp = (THP_SIZE / MAP_UNIT) as usize;
+    let num_chunks = (size / THP_SIZE) as usize;
+    let mut collapsed: u64 = 0;
+    let mut failed: u64 = 0;
+
+    for ci in 0..num_chunks {
+        let map_base = ci * units_per_thp;
+        // Already a full 2MB folio – nothing to do.
+        if (0..units_per_thp).all(|u| order_map[map_base + u] >= 9) {
+            continue;
+        }
+
+        let ptr = host_addr.add((ci as u64 * THP_SIZE) as usize);
+        let ret = libc::madvise(ptr as *mut libc::c_void, THP_SIZE as usize, MADV_COLLAPSE);
+        if ret == 0 {
+            for u in 0..units_per_thp {
+                order_map[map_base + u] = 9;
+            }
+            collapsed += 1;
+        } else {
+            failed += 1;
+        }
+    }
+
+    (collapsed, failed)
+}
+
 // ── public API ──────────────────────────────────────────────────────────────
 
 /// Result of [`prepare_lend_region`]: carries a per-2MB bitmap indicating
@@ -88,12 +128,30 @@ pub struct LendPrepResult {
 /// Implements the four-phase strategy from QEMU's `gunyah_add_mem`:
 ///   Phase 1 – drop caches, compact, enable mTHP intermediate sizes
 ///   Phase 2 – populate in 64 MB batches (MADV_POPULATE_WRITE)
-///   Phase 3 – cascading MADV_COLLAPSE (2 MB → 64 KB)
+///   Phase 3 – collapse to large pages
 ///   Phase 4 – mlock
+///
+/// `strict_full_thp` selects the Phase 3 behaviour:
+///
+/// * `false` (demand-paging kernels, e.g. sm8750 / `Chunked`): run the
+///   diagnostic cascade `2MB → 64KB`, accept whatever backing the kernel can
+///   give, and report it via `need_small`.  Always returns `Ok`.
+///
+/// * `true` (eager-parcel kernels, e.g. sm8650 / `Single`): run a single
+///   `MADV_COLLAPSE(2MB)` pass that ONLY accepts full 2MB folios.  If any window
+///   is not a true 2MB THP, return `Err(errno)` so the caller aborts VM start
+///   instead of handing RM a parcel with a misaligned segment (which deadlocks
+///   RM and triggers a PMIC watchdog reboot of the whole phone).
+///
+/// On success every entry of `need_small` is `false` in strict mode.
 ///
 /// # Safety
 /// `host_addr` must point to a valid memory mapping of at least `size` bytes.
-pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResult {
+pub unsafe fn prepare_lend_region(
+    host_addr: *mut u8,
+    size: u64,
+    strict_full_thp: bool,
+) -> Result<LendPrepResult, i32> {
     info!(
         "GH: preparing LEND region: hva={:#x} size={:#x} ({} MB)",
         host_addr as u64,
@@ -174,13 +232,16 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
         info!("GH: Phase 2: population complete");
     }
 
-    // ── Phase 3: cascading MADV_COLLAPSE (2 MB → 64 KB) ────────────
+    // ── Phase 3: collapse to large pages ────────────────────────────
 
     let map_count = (size / MAP_UNIT) as usize;
     let mut order_map = vec![0u8; map_count];
     let mut large_page_bytes: u64 = 0;
 
-    {
+    if !strict_full_thp {
+        // Diagnostic cascade 2MB → 64KB: take whatever backing the kernel can
+        // give and report it via `need_small`.  Only safe for demand-paging
+        // kernels (sm8750) that can handle a parcel with mixed-size segments.
         info!("GH: Phase 3: cascading MADV_COLLAPSE (2MB -> 64KB) ...");
 
         for level in COLLAPSE_LEVELS {
@@ -265,6 +326,34 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
                 }
             }
         }
+    } else {
+        // Strict: ONLY accept full 2MB folios.  Eager-parcel kernels (sm8650)
+        // lend the whole region in one shot, and a single sub-2MB segment in
+        // the parcel deadlocks RM → PMIC watchdog reboots the phone.  So we
+        // never fall back to 1MB/512KB/…: one MADV_COLLAPSE(2MB) pass, and if
+        // any window is not a full 2MB THP we abort VM start with ENOMEM.
+        let total_chunks = (size / THP_SIZE) as usize;
+        info!(
+            "GH: Phase 3 (strict): forcing full 2MB THP over {} windows ...",
+            total_chunks
+        );
+
+        let (ok, fail) = collapse_2mb_pass(host_addr, size, &mut order_map);
+        info!("GH:   strict collapse pass: {} collapsed, {} failed", ok, fail);
+
+        if fail > 0 {
+            error!(
+                "GH: cannot guarantee full 2MB backing: {}/{} windows are not full 2MB. \
+                 Aborting VM start to avoid a misaligned LEND parcel that would deadlock RM \
+                 and watchdog-reboot the device. Free memory / reduce guest RAM and retry.",
+                fail, total_chunks
+            );
+            // Phase 4 (mlock) has not run yet, so there is nothing to unlock.
+            return Err(libc::ENOMEM);
+        }
+
+        large_page_bytes = size; // every window is a verified 2MB THP
+        info!("GH: Phase 3 (strict): all {} windows are full 2MB THP", total_chunks);
     }
 
     info!(
@@ -295,10 +384,10 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
         need_small[ci] = !is_thp;
     }
 
-    LendPrepResult {
+    Ok(LendPrepResult {
         need_small,
         large_page_bytes,
-    }
+    })
 }
 
 /// An individual chunk to LEND, produced by [`compute_lend_chunks`].
